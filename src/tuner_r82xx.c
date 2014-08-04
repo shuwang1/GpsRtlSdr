@@ -561,6 +561,8 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	/* sdm calculator */
 	sdm = (((vco_freq<<16)+pll_ref) / (2*pll_ref)) & 0xFFFF;
 
+	//fprintf(stderr, "LO: %u kHz, MixDiv: %u, PLLDiv: %u, VCO %u kHz, SDM: %u \n", (uint32_t)(freq/1000), mix_div, nint,  (uint32_t)(vco_freq/1000), sdm);
+
 	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
 	if (rc < 0)
 		return rc;
@@ -580,27 +582,25 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 //		usleep_range(sleep_time, sleep_time + 1000);
 
 		/* Check if PLL has locked */
+		data[2] = 0;
 		rc = r82xx_read(priv, 0x00, data, 3);
 		if (rc < 0)
 			return rc;
 		if (data[2] & 0x40)
 			break;
+		if (i > 0)
+			break;
 
-		if (!i) {
-			/* Didn't lock. Increase VCO current */
-			rc = r82xx_write_reg_mask(priv, 0x12, 0x60, 0xe0);
-			if (rc < 0)
-				return rc;
-		}
+		/* Didn't lock. Increase VCO current */
+		rc = r82xx_write_reg_mask(priv, 0x12, 0x60, 0xe0);
+		if (rc < 0)
+			return rc;
 	}
 
 	if (!(data[2] & 0x40)) {
 		fprintf(stderr, "[R82XX] PLL not locked!\n");
-		priv->has_lock = 0;
-		return 0;
+		return -1;
 	}
-
-	priv->has_lock = 1;
 
 	/* set pll autotune = 8kHz */
 	rc = r82xx_write_reg_mask(priv, 0x1a, 0x08, 0x08);
@@ -1074,7 +1074,7 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 		goto err;
 
 	rc = r82xx_set_pll(priv, lo_freq);
-	if (rc < 0 || !priv->has_lock)
+	if (rc < 0)
 		goto err;
 
 	/* switch between 'Cable1' and 'Air-In' inputs on sticks with
