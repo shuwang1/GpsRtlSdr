@@ -37,6 +37,30 @@
  * Static constants
  */
 
+/*
+ * These should be "safe" values, always. If we fail to get PLL lock in this range,
+ * it's a hard error.
+ */
+#define PLL_SAFE_LOW 28e6
+#define PLL_SAFE_HIGH 1845e6
+
+/*
+ * These are the initial, widest, PLL limits that we will try.
+ *
+ * Be cautious with lowering the low bound further - the PLL can claim to be locked
+ * when configured to a lower frequency, but actually be running at around 26.6MHz
+ * regardless of what it was configured for.
+ *
+ * This shows up as a tuning offset at low frequencies, and a "dead zone" about
+ * 6MHz below the PLL lower bound where retuning within that region has no effect.
+ */
+#define PLL_INITIAL_LOW 26.7e6
+#define PLL_INITIAL_HIGH 1860e6
+
+/* We shrink the range edges by at least this much each time there is a soft PLL lock failure */
+#define PLL_STEP_LOW 0.1e6
+#define PLL_STEP_HIGH 1.0e6
+
 /* Those initial values start from REG_SHADOW_START */
 static const uint8_t r82xx_init_array[NUM_REGS] = {
 	0x83, 0x32, 0x75,			/* 05 to 07 */
@@ -344,7 +368,7 @@ static int r82xx_write_batch_sync(struct r82xx_priv *priv)
 		return -1;
 	priv->reg_batch = 0;
 	if (priv->reg_low > priv->reg_high)
-		return 0; /* No registers were changed */
+		return 0; /* No work to do */
 	offset = priv->reg_low - REG_SHADOW_START;
 	len = priv->reg_high - priv->reg_low + 1;
 	rc = r82xx_write(priv, priv->reg_low, priv->regs+offset, len);
@@ -451,13 +475,13 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
 	return rc;
 }
 
-static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
+static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq, uint32_t *freq_out)
 {
 	int rc, i;
 	unsigned sleep_time = 10000;
 	uint64_t vco_freq;
 	uint64_t vco_div;
-	uint32_t vco_min = 1770000; /* kHz */
+	uint32_t vco_min = 1750000; /* kHz */
 	uint32_t vco_max = vco_min * 2; /* kHz */
 	uint32_t freq_khz, pll_ref;
 	uint32_t sdm = 0;
@@ -485,30 +509,16 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		return rc;
 
 	/* set VCO current = 100 */
+	priv->pll_off = 0;
 	rc = r82xx_write_reg_mask(priv, 0x12, 0x80, 0xe0);
 	if (rc < 0)
 		return rc;
 
 	/* Calculate divider */
-	if(freq_khz < vco_min/64) vco_min /= 2;
-	if(freq_khz >= vco_max/2) vco_max *= 2;
-	while (mix_div <= 64) {
-		if (((freq_khz * mix_div) >= vco_min) &&
-		   ((freq_khz * mix_div) < vco_max)) {
-			div_buf = mix_div;
-			while (div_buf > 2) {
-				div_buf = div_buf >> 1;
-				div_num++;
-			}
-			break;
-		}
-		mix_div = mix_div << 1;
-	}
 
-	if (mix_div > 64) {
-		fprintf(stderr, "[R82XX] No valid PLL values for %u Hz!\n", freq);
-		return -1;
-	}
+	for (mix_div = 2, div_num = 0; mix_div < 64; mix_div <<= 1, div_num++)
+		if ((freq_khz * mix_div) >= vco_min)
+			break;
 
 	if (priv->cfg->rafael_chip == CHIP_R828D)
 		vco_power_ref = 1;
@@ -557,6 +567,11 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	ni = (nint - 13) / 4;
 	si = nint - 4 * ni - 13;
 
+	if (freq_out) {
+		uint64_t actual_vco = (uint64_t)2 * pll_ref * nint + (uint64_t)2 * pll_ref * sdm / 65536;
+		*freq_out = (uint32_t) ((actual_vco + mix_div/2) / mix_div);
+	}
+
 	rc = r82xx_write_reg(priv, 0x14, ni + (si << 6));
 	if (rc < 0)
 		return rc;
@@ -573,8 +588,6 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	rc = r82xx_write_reg_mask(priv, 0x12, val, 0x18);
 	if (rc < 0)
 		return rc;
-
-	//fprintf(stderr, "LO: %u kHz, MixDiv: %u, PLLDiv: %u, VCO %u kHz, SDM: %u \n", (uint32_t)(freq/1000), mix_div, nint,  (uint32_t)(vco_freq/1000), sdm);
 
 	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
 	if (rc < 0)
@@ -611,8 +624,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	}
 
 	if (!(data[2] & 0x40)) {
-		fprintf(stderr, "[R82XX] PLL not locked!\n");
-		return -1;
+		return -42;
 	}
 
 	/* set pll autotune = 8kHz */
@@ -906,10 +918,14 @@ static int r82xx_init_tv_standard(struct r82xx_priv *priv,
 	return 0;
 }
 
-static int r82xx_set_if_filter(struct r82xx_priv *priv, int hpf, int lpf) {
-	int rc, i;
+static int update_if_filter(struct r82xx_priv *priv) {
+	int rc, i, hpf, lpf;
 	uint8_t filt_q, hp_cor;
 	int cal;
+
+	hpf = ((int)priv->if_filter_freq - (int)priv->bw/2)/1000;
+	lpf = ((int)priv->if_filter_freq + (int)priv->bw/2)/1000;
+
 	filt_q = 0x10;		/* r10[4]:low q(1'b1) */
 
 	if(lpf <= 2500) {
@@ -950,8 +966,6 @@ static int r82xx_set_if_filter(struct r82xx_priv *priv, int hpf, int lpf) {
 	else if(cal > 15) cal = 15;
 	priv->fil_cal_code = cal;
 
-	//fprintf(stderr, "Setting IF filter for %d...%d kHz: hp_cor=0x%02x, fil_cal_code=%d\n", hpf, lpf, hp_cor, cal);
-
 	rc = r82xx_write_reg_mask(priv, 0x0a,
 				  filt_q | priv->fil_cal_code, 0x1f);
 	if (rc < 0)
@@ -967,12 +981,7 @@ static int r82xx_set_if_filter(struct r82xx_priv *priv, int hpf, int lpf) {
 
 int r82xx_set_bw(struct r82xx_priv *priv, uint32_t bw) {
 	priv->bw = bw;
-	return r82xx_set_if_filter(priv, ((int)priv->int_freq - (int)bw/2)/1000, ((int)priv->int_freq + (int)bw/2)/1000);
-}
-
-int r82xx_set_if_freq(struct r82xx_priv *priv, uint32_t freq) {
-	priv->int_freq = freq;
-	return r82xx_set_if_filter(priv, ((int)freq - (int)priv->bw/2)/1000, ((int)freq + (int)priv->bw/2)/1000);
+	return update_if_filter(priv);
 }
 
 static int r82xx_read_gain(struct r82xx_priv *priv)
@@ -1074,21 +1083,19 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
 	return 0;
 }
 
-int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
+int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq, uint32_t *lo_freq_out)
 {
-	int rc = -1;
+	int rc;
 	uint32_t lo_freq = freq + priv->int_freq;
+	uint32_t margin = 1e6 + priv->bw/2;
 	uint8_t air_cable1_in;
+	int changed_pll_limits = 0;
 
 	r82xx_write_batch_init(priv);
 
-	rc = r82xx_set_mux(priv, lo_freq);
-	if (rc < 0)
-		goto err;
+	/* RF input settings */
 
-	rc = r82xx_set_pll(priv, lo_freq);
-	if (rc < 0)
-		goto err;
+	rc = r82xx_set_mux(priv, freq);
 
 	/* switch between 'Cable1' and 'Air-In' inputs on sticks with
 	 * R828D tuner. We switch at 345 MHz, because that's where the
@@ -1099,12 +1106,118 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 	if ((priv->cfg->rafael_chip == CHIP_R828D) &&
 	    (air_cable1_in != priv->input)) {
 		priv->input = air_cable1_in;
-		rc = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
+		rc |= r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
 	}
 
-	if (priv->reg_batch) {
-		rc = r82xx_write_batch_sync(priv);
+	/* IF generation settings */
+
+ retune:
+	if (freq < 14.4e6 && freq < (priv->pll_low_limit - 14.4e6)) {
+		/* Previously "no-mod direct sampling" - confuse the VCO/PLL
+		 * sufficiently that we get the HF signal leaking through
+		 * the tuner, then sample that directly.
+		 *
+		 * Disable the VCO, as far as we can.
+		 * This throws a big spike of noise into the signal,
+		 * so only do it once when crossing the 14.4MHz boundary,
+		 * not on every retune.
+		 */
+		if (!priv->pll_off) {
+			rc |= r82xx_set_pll(priv, 50e6, NULL);              /* Might influence the noise floor? */
+			rc |= r82xx_write_reg_mask(priv, 0x10, 0xd0, 0xe0); /* impossible mix_div setting */
+			rc |= r82xx_write_reg_mask(priv, 0x12, 0xe0, 0xe0); /* VCO current = 0 */
+			priv->pll_off = 1;
+		}
+
+		/* We are effectively tuned to 0Hz - the downconverter must do all the heavy lifting now */
+		lo_freq = 0;
+		if (lo_freq_out) *lo_freq_out = 0;
+	} else {
+		/* Normal tuning case */
+		int pll_error = 0;
+
+		if (priv->pll_off) {
+			/* Crossed the 14.4MHz boundary, power the VCO back on */
+			rc |= r82xx_write_reg_mask(priv, 0x12, 0x80, 0xe0);
+			priv->pll_off = 0;
+		}
+
+		/*
+		 * Keep PLL within empirically stable bounds; outside those bounds,
+		 * we prefer to tune to the "wrong" frequency; the difference will be
+		 * mopped up by the 2832 downconverter.
+		 *
+		 * Beware that outside the stable range, the PLL can claim to be locked
+		 * while it is actually stuck at a different frequency (e.g. sometimes
+		 * it can claim to get PLL lock when configured anywhere between 24 and
+		 * 26MHz, but it actually always locks to 26.6-ish).
+		 *
+		 * Make sure to keep the LO away from tuned frequency as there seems
+		 * to be a ~600kHz high-pass filter in the IF path, so you don't want
+		 * any interesting frequencies to land near the IF.
+		 */
+
+		if (lo_freq < priv->pll_low_limit) {
+			if (freq > (priv->pll_low_limit-margin) && freq < (priv->pll_low_limit+margin)) {
+				lo_freq = freq + margin;
+			} else {
+				lo_freq = priv->pll_low_limit;
+			}
+		} else if (lo_freq > priv->pll_high_limit) {
+			if (freq > (priv->pll_high_limit-margin) && freq < (priv->pll_high_limit+margin)) {
+				lo_freq = freq - margin;
+			} else {
+				lo_freq = priv->pll_high_limit;
+			}
+		}
+
+		pll_error = r82xx_set_pll(priv, lo_freq, lo_freq_out);
+		if (pll_error == -42) {
+			/* Magic return value to say that the PLL didn't lock.
+			 * If we are close to the edge of the PLL range, shift the range and try again.
+			 */
+			if (lo_freq < PLL_SAFE_LOW) {
+				priv->pll_low_limit = lo_freq + PLL_STEP_LOW;
+				if (priv->pll_low_limit > PLL_SAFE_LOW)
+					priv->pll_low_limit = PLL_SAFE_LOW;
+				changed_pll_limits = 1;
+				goto retune;
+			} else if (lo_freq > PLL_SAFE_HIGH) {
+				priv->pll_high_limit = lo_freq - PLL_STEP_HIGH;
+				if (priv->pll_high_limit < PLL_SAFE_HIGH)
+					priv->pll_high_limit = PLL_SAFE_HIGH;
+				changed_pll_limits = 1;
+				goto retune;
+			} else {
+				fprintf(stderr, "[r82xx] Failed to get PLL lock at %u Hz\n", lo_freq);
+			}
+		}
+
+		rc |= pll_error;
 	}
+
+	if (changed_pll_limits) {
+		fprintf(stderr, "[r82xx] Updated PLL limits to %u .. %u Hz\n", priv->pll_low_limit, priv->pll_high_limit);
+	}
+
+	/* IF filter / image rejection settings */
+
+	if (lo_freq > freq) {
+		/* high-side mixing, image negative */
+		rc |= r82xx_write_reg_mask(priv, 0x07, 0x00, 0x80);
+		priv->if_filter_freq = lo_freq - freq;
+	} else {
+		/* low-side mixing, image positive */
+		rc |= r82xx_write_reg_mask(priv, 0x07, 0x80, 0x80);
+		priv->if_filter_freq = freq - lo_freq;
+	}
+
+	update_if_filter(priv);
+
+	if (priv->reg_batch) {
+		rc |= r82xx_write_batch_sync(priv);
+	}
+
 err:
 	if (rc < 0)
 		fprintf(stderr, "%s: failed=%d\n", __FUNCTION__, rc);
@@ -1117,22 +1230,17 @@ int r82xx_set_nomod(struct r82xx_priv *priv)
 
 	fprintf(stderr, "Using R820T no-mod direct sampling mode\n");
 
-	/* should probably play a bit more with the mux settings
-	    to see if something works even better than this */
+	/*rc = r82xx_set_bw(priv, 1000000);
+	if (rc < 0)
+		goto err;*/
 
+	/* experimentally determined magic numbers
+	 * needs more experimenting with all the registers */
 	rc = r82xx_set_mux(priv, 300000000);
-	if (rc < 0) goto err;
+	if (rc < 0)
+		goto err;
 
-	/* the VCO frequency setting still seems to have some effect on the noise floor */
-	rc = r82xx_set_pll(priv, 50000000);
-	if (rc < 0) goto err;
-
-	/* the most important part: set a divider number that does not really work */
-	rc = r82xx_write_reg_mask(priv, 0x10, 0xd0, 0xe0);
-	if (rc < 0) goto err;
-
-	/* VCO power off */
-	rc = r82xx_write_reg_mask(priv, 0x12, 0xe0, 0xe0);
+	r82xx_set_pll(priv, 25000000, NULL);
 
 err:
 	if (rc < 0)
@@ -1281,6 +1389,9 @@ int r82xx_init(struct r82xx_priv *priv)
 	   so there's no need to call r82xx_set_if_filter here */
 
 	rc |= r82xx_sysfreq_sel(priv, 0, TUNER_DIGITAL_TV, SYS_DVBT);
+
+	priv->pll_low_limit = PLL_INITIAL_LOW;
+	priv->pll_high_limit = PLL_INITIAL_HIGH;
 
 	priv->init_done = 1;
 	priv->reg_cache = 1;
